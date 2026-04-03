@@ -2208,8 +2208,21 @@ pub fn render_prompt_input(
     }
 
     // Token estimate overlay on the first text row (top-right corner).
+    // Format mirrors TS formatTokens: compact "1.3k" for ≥1000, raw number below that.
     if state.text.len() > 1000 && area.height > 1 {
-        let count_str = format!("~{}t", state.token_estimate);
+        let n = state.token_estimate;
+        let formatted = if n >= 1000 {
+            let k = n as f64 / 1000.0;
+            // One decimal place, suppress trailing ".0" (e.g. 2000 → "2k", 1300 → "1.3k")
+            if (k * 10.0).round() % 10.0 == 0.0 {
+                format!("~{}k", k as u64)
+            } else {
+                format!("~{:.1}k", k)
+            }
+        } else {
+            format!("~{}", n)
+        };
+        let count_str = formatted;
         let x = area.x + area.width.saturating_sub(count_str.len() as u16);
         Paragraph::new(Line::from(vec![Span::styled(
             count_str,

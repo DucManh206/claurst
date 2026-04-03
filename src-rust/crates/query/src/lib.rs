@@ -18,7 +18,7 @@ pub mod coordinator;
 pub mod cron_scheduler;
 pub mod session_memory;
 pub mod skill_prefetch;
-pub use agent_tool::AgentTool;
+pub use agent_tool::{AgentTool, init_team_swarm_runner};
 pub use command_queue::{CommandPriority, CommandQueue, QueuedCommand, drain_command_queue};
 pub use cron_scheduler::start_cron_scheduler;
 pub use skill_prefetch::{
@@ -509,7 +509,23 @@ pub async fn run_query_loop(
             .map(|t| ApiToolDefinition::from(&t.to_definition()))
             .collect();
 
-        let system = build_system_prompt(config);
+        // Verification nudge: if there are incomplete todos for this session
+        // and the conversation has more than 2 turns, append a reminder.
+        let system = if turn > 2 {
+            let nudge = build_todo_nudge(&tool_ctx.session_id);
+            if nudge.is_empty() {
+                build_system_prompt(config)
+            } else {
+                let mut patched = config.clone();
+                patched.append_system_prompt = Some(match &config.append_system_prompt {
+                    Some(existing) => format!("{}\n\n{}", existing, nudge),
+                    None => nudge,
+                });
+                build_system_prompt(&patched)
+            }
+        } else {
+            build_system_prompt(config)
+        };
 
         let mut req_builder = CreateMessageRequest::builder(&effective_model, config.max_tokens)
             .messages(api_messages)
@@ -876,6 +892,46 @@ pub async fn run_query_loop(
                     }
                 }
 
+                // Trigger AutoDream consolidation check (non-blocking, best-effort).
+                // maybe_trigger() checks gates + acquires lock. If it returns
+                // Some(task), we spawn a background subagent via AgentTool so
+                // the spawn doesn't call run_query_loop recursively from within
+                // its own future (which would make the future !Send).
+                {
+                    let memory_dir = dirs::home_dir().map(|h| h.join(".claude").join("memory"));
+                    let conversations_dir =
+                        dirs::home_dir().map(|h| h.join(".claude").join("conversations"));
+                    if let (Some(mem), Some(conv)) = (memory_dir, conversations_dir) {
+                        let dreamer = crate::auto_dream::AutoDream::new(mem, conv);
+                        if let Ok(Some(task)) = dreamer.maybe_trigger().await {
+                            // Run the consolidation subagent in a background Tokio
+                            // task. We use the AgentTool execute path (via
+                            // poll_background_agent / BACKGROUND_AGENTS) to avoid
+                            // re-entering run_query_loop from within the same
+                            // future graph.
+                            let agent_input = serde_json::json!({
+                                "description": "memory consolidation",
+                                "prompt": task.prompt,
+                                "max_turns": 20,
+                                "system_prompt": "You are performing automatic memory consolidation. Complete the task and return a brief summary.",
+                                "run_in_background": true,
+                                "isolation": null
+                            });
+                            let ctx_for_dream = tool_ctx.clone();
+                            tokio::spawn(async move {
+                                let agent = crate::agent_tool::AgentTool;
+                                let _result = cc_tools::Tool::execute(
+                                    &agent,
+                                    agent_input,
+                                    &ctx_for_dream,
+                                )
+                                .await;
+                                crate::auto_dream::AutoDream::finish_consolidation(&task).await;
+                            });
+                        }
+                    }
+                }
+
                 return QueryOutcome::EndTurn {
                     message: assistant_msg,
                     usage,
@@ -929,10 +985,36 @@ pub async fn run_query_loop(
                     };
                 }
 
-                let mut result_blocks: Vec<ContentBlock> = Vec::new();
+                // ---------------------------------------------------------------------------
+                // Streaming tool executor: parallel non-agent tool dispatch.
+                //
+                // Phase 1: Run PreToolUse hooks sequentially (they can block/deny execution
+                //          and may display interactive permission dialogs).
+                // Phase 2: Dispatch all non-blocked tool executions concurrently via
+                //          futures::future::join_all, preserving original order.
+                // Phase 3: Fire PostToolUse hooks + emit events, then collect results.
+                //
+                // This mirrors the TypeScript StreamingToolExecutor pattern.
+                // ---------------------------------------------------------------------------
 
+                // Intermediate record produced during Phase 1.
+                struct PreparedTool {
+                    id: String,
+                    name: String,
+                    input: Value,
+                    /// None means the pre-hook blocked execution; the String is the error reason.
+                    blocked_result: Option<ToolResult>,
+                }
+
+                // Phase 1: sequential pre-hook pass.
+                let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
                 for block in tool_blocks {
                     if let ContentBlock::ToolUse { id, name, input } = block {
+                        // Clone from the references returned by get_tool_use_blocks()
+                        let id = id.clone();
+                        let name = name.clone();
+                        let input = input.clone();
+
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::ToolStart {
                                 tool_name: name.clone(),
@@ -941,7 +1023,6 @@ pub async fn run_query_loop(
                             });
                         }
 
-                        // Fire PreToolUse hooks (blocking hooks can cancel execution)
                         let hooks = &tool_ctx.config.hooks;
                         let hook_ctx = cc_core::hooks::HookContext {
                             event: "PreToolUse".to_string(),
@@ -959,60 +1040,101 @@ pub async fn run_query_loop(
                         )
                         .await;
 
-                        // Also run plugin PreToolUse hooks (stored in global static).
                         let plugin_pre_outcome =
                             cc_plugins::run_global_pre_tool_hook(&name, &input);
 
-                        let result = if let cc_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
-                            warn!(tool = name, reason = %reason, "PreToolUse hook blocked execution");
-                            cc_tools::ToolResult::error(format!("Blocked by hook: {}", reason))
-                        } else if let cc_plugins::HookOutcome::Deny(reason) = plugin_pre_outcome {
-                            warn!(tool = name, reason = %reason, "Plugin PreToolUse hook blocked execution");
-                            cc_tools::ToolResult::error(format!("Blocked by plugin hook: {}", reason))
-                        } else {
-                            execute_tool(&name, &input, tools, tool_ctx).await
-                        };
+                        let blocked_result =
+                            if let cc_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
+                                warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
+                                Some(cc_tools::ToolResult::error(format!(
+                                    "Blocked by hook: {}",
+                                    reason
+                                )))
+                            } else if let cc_plugins::HookOutcome::Deny(reason) = plugin_pre_outcome {
+                                warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
+                                Some(cc_tools::ToolResult::error(format!(
+                                    "Blocked by plugin hook: {}",
+                                    reason
+                                )))
+                            } else {
+                                None
+                            };
 
-                        // Fire PostToolUse hooks
-                        let post_ctx = cc_core::hooks::HookContext {
-                            event: "PostToolUse".to_string(),
-                            tool_name: Some(name.clone()),
-                            tool_input: Some(input.clone()),
-                            tool_output: Some(result.content.clone()),
-                            is_error: Some(result.is_error),
-                            session_id: Some(tool_ctx.session_id.clone()),
-                        };
-                        cc_core::hooks::run_hooks(
-                            hooks,
-                            cc_core::config::HookEvent::PostToolUse,
-                            &post_ctx,
-                            &tool_ctx.working_dir,
-                        )
-                        .await;
-
-                        // Also run plugin PostToolUse hooks.
-                        cc_plugins::run_global_post_tool_hook(
-                            &name,
-                            &input,
-                            &result.content,
-                            result.is_error,
-                        );
-
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx.send(QueryEvent::ToolEnd {
-                                tool_name: name.clone(),
-                                tool_id: id.clone(),
-                                result: result.content.clone(),
-                                is_error: result.is_error,
-                            });
-                        }
-
-                        result_blocks.push(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: ToolResultContent::Text(result.content),
-                            is_error: if result.is_error { Some(true) } else { None },
+                        prepared.push(PreparedTool {
+                            id,
+                            name,
+                            input,
+                            blocked_result,
                         });
                     }
+                }
+
+                // Phase 2: build execution futures for non-blocked tools and join them.
+                // Blocked tools yield a ready future with the pre-computed error result.
+                // Non-blocked tools execute concurrently via join_all.
+                // Each async block owns its cloned name/input so there are no lifetime issues.
+                let exec_futures: Vec<_> = prepared
+                    .iter()
+                    .map(|p| {
+                        if p.blocked_result.is_some() {
+                            let r = p.blocked_result.clone().unwrap();
+                            futures::future::Either::Left(async move { r })
+                        } else {
+                            let name = p.name.clone();
+                            let input = p.input.clone();
+                            futures::future::Either::Right(async move {
+                                execute_tool(&name, &input, tools, tool_ctx).await
+                            })
+                        }
+                    })
+                    .collect();
+
+                // Run all tool futures concurrently; join_all preserves order.
+                let exec_results: Vec<ToolResult> =
+                    futures::future::join_all(exec_futures).await;
+
+                // Phase 3: post-hooks, event emission, and result block assembly.
+                let mut result_blocks: Vec<ContentBlock> =
+                    Vec::with_capacity(prepared.len());
+                for (p, result) in prepared.iter().zip(exec_results.into_iter()) {
+                    let hooks = &tool_ctx.config.hooks;
+                    let post_ctx = cc_core::hooks::HookContext {
+                        event: "PostToolUse".to_string(),
+                        tool_name: Some(p.name.clone()),
+                        tool_input: Some(p.input.clone()),
+                        tool_output: Some(result.content.clone()),
+                        is_error: Some(result.is_error),
+                        session_id: Some(tool_ctx.session_id.clone()),
+                    };
+                    cc_core::hooks::run_hooks(
+                        hooks,
+                        cc_core::config::HookEvent::PostToolUse,
+                        &post_ctx,
+                        &tool_ctx.working_dir,
+                    )
+                    .await;
+
+                    cc_plugins::run_global_post_tool_hook(
+                        &p.name,
+                        &p.input,
+                        &result.content,
+                        result.is_error,
+                    );
+
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::ToolEnd {
+                            tool_name: p.name.clone(),
+                            tool_id: p.id.clone(),
+                            result: result.content.clone(),
+                            is_error: result.is_error,
+                        });
+                    }
+
+                    result_blocks.push(ContentBlock::ToolResult {
+                        tool_use_id: p.id.clone(),
+                        content: ToolResultContent::Text(result.content),
+                        is_error: if result.is_error { Some(true) } else { None },
+                    });
                 }
 
                 // Append tool results as a user message
@@ -1068,6 +1190,26 @@ async fn execute_tool(
             warn!(tool = name, "Unknown tool requested");
             ToolResult::error(format!("Unknown tool: {}", name))
         }
+    }
+}
+
+/// Load persisted todos for `session_id` and return a nudge string if any are
+/// incomplete (status != "completed"). Returns empty string otherwise.
+fn build_todo_nudge(session_id: &str) -> String {
+    let todos = cc_tools::todo_write::load_todos(session_id);
+    let incomplete_count = todos
+        .iter()
+        .filter(|t| t["status"].as_str().map_or(true, |s| s != "completed"))
+        .count();
+    if incomplete_count == 0 {
+        String::new()
+    } else {
+        format!(
+            "You have {} incomplete task{} in your TodoWrite list. \
+             Make sure to complete all tasks before ending your response.",
+            incomplete_count,
+            if incomplete_count == 1 { "" } else { "s" }
+        )
     }
 }
 

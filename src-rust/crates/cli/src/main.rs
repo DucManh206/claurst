@@ -16,6 +16,7 @@ use cc_core::{
     constants::{APP_VERSION, DEFAULT_MODEL},
     context::ContextBuilder,
     cost::CostTracker,
+    feature_flags::FeatureFlagManager,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler},
 };
 use async_trait::async_trait;
@@ -533,6 +534,15 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
     };
 
+    // Register the cc-query-backed agent runner so TeamCreateTool can spawn real
+    // sub-agents.  Must be called before any tool execution begins.
+    // The function is idempotent if already registered (panics only on double-call,
+    // but we guard with a std::sync::OnceLock internally).
+    {
+        static SWARM_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SWARM_INIT.get_or_init(|| cc_query::init_team_swarm_runner());
+    }
+
     // Build the full tool list: built-ins from cc-tools plus AgentTool from cc-query
     // (AgentTool lives in cc-query to avoid a circular cc-tools ↔ cc-query dependency).
     // Wrap in Arc so the list can be shared by the main loop AND the cron scheduler.
@@ -603,6 +613,13 @@ async fn main() -> anyhow::Result<()> {
         cron_cancel.clone(),
     );
 
+    // Initialize feature flags from GrowthBook
+    let feature_flags = FeatureFlagManager::new();
+    if let Err(e) = feature_flags.fetch_flags_async().await {
+        debug!("Failed to initialize feature flags: {}", e);
+        // Non-fatal error: continue with defaults
+    }
+
     // --print mode (headless)
     let result = if is_headless {
         run_headless(
@@ -612,6 +629,7 @@ async fn main() -> anyhow::Result<()> {
             tool_ctx,
             query_config,
             cost_tracker,
+            feature_flags,
         )
         .await
     } else {
@@ -625,6 +643,7 @@ async fn main() -> anyhow::Result<()> {
             cost_tracker,
             cli.resume,
             bridge_config,
+            feature_flags,
         )
         .await
     };
@@ -677,6 +696,7 @@ async fn run_headless(
     tool_ctx: ToolContext,
     query_config: cc_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
+    feature_flags: FeatureFlagManager,
 ) -> anyhow::Result<()> {
     use cc_query::{QueryEvent, QueryOutcome};
     use tokio::sync::mpsc;
@@ -931,6 +951,7 @@ async fn run_interactive(
     cost_tracker: Arc<CostTracker>,
     resume_id: Option<String>,
     bridge_config: Option<cc_bridge::BridgeConfig>,
+    feature_flags: FeatureFlagManager,
 ) -> anyhow::Result<()> {
     use cc_commands::{execute_command, CommandContext, CommandResult};
     use cc_bridge::{BridgeOutbound, TuiBridgeEvent};
@@ -1072,6 +1093,12 @@ async fn run_interactive(
         cancel: CancellationToken,
     }
 
+    // Preserve the bridge token before consuming bridge_config so we can reconstruct
+    // a BridgeSessionInfo once the bridge worker reports it has connected.
+    let bridge_token: Option<String> = bridge_config
+        .as_ref()
+        .and_then(|c| c.session_token.clone());
+
     let mut bridge_runtime: Option<BridgeRuntime> = if let Some(cfg) = bridge_config {
         let bridge_cancel = CancellationToken::new();
         let (tui_tx, tui_rx) = mpsc::channel::<TuiBridgeEvent>(64);
@@ -1095,6 +1122,23 @@ async fn run_interactive(
     } else {
         None
     };
+
+    // Relay channels for the BridgeSessionInfo-based event path.
+    //
+    // relay_ev_tx:    receives serialised JSON event payloads from the query-event
+    //                 drain loop; a background task consumes them and calls
+    //                 post_bridge_event so the web UI sees live streaming events.
+    // relay_ev_rx_opt: Option wrapper so we can move the Receiver into the relay
+    //                 task exactly once when the bridge session comes online.
+    // remote_prompt_tx/rx: inbound user messages polled from poll_bridge_messages
+    //                 are delivered here; the main loop injects them as query turns.
+    let (relay_ev_tx, relay_ev_rx) = mpsc::channel::<String>(256);
+    let mut relay_ev_rx_opt: Option<mpsc::Receiver<String>> = Some(relay_ev_rx);
+    let (remote_prompt_tx, mut remote_prompt_rx) = mpsc::channel::<String>(32);
+
+    // Once the bridge worker reports Connected we build this from the session
+    // credentials so both relay tasks can POST/poll the /api/bridge/sessions API.
+    let mut bridge_session_info: Option<std::sync::Arc<cc_bridge::BridgeSessionInfo>> = None;
 
     let mut messages = initial_messages;
     let mut cmd_ctx = CommandContext {
@@ -1268,6 +1312,16 @@ async fn run_interactive(
                                     app.open_rewind_flow();
                                     app.status_message =
                                         Some("Select a message to rewind to.".to_string());
+                                }
+                                Some(CommandResult::OpenHooksOverlay) => {
+                                    // Open the 4-screen hooks configuration browser.
+                                    // intercept_slash_command("hooks") already does this
+                                    // when the user types /hooks in the TUI prompt, so
+                                    // this branch only triggers when the command returns
+                                    // the variant explicitly (e.g. from a non-prompt context).
+                                    app.hooks_config_menu.open();
+                                    app.status_message =
+                                        Some("Hooks configuration browser".to_string());
                                 }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
                                     session = resumed_session;
@@ -1601,6 +1655,40 @@ async fn run_interactive(
                     let _ = runtime.outbound_tx.try_send(ob);
                 }
             }
+            // Also forward to the BridgeSessionInfo relay channel (best-effort).
+            // This drives the post_bridge_event relay task spawned on Connected.
+            if bridge_session_info.is_some() {
+                let relay_payload: Option<String> = match &evt {
+                    QueryEvent::Stream(cc_api::StreamEvent::ContentBlockDelta {
+                        delta: cc_api::streaming::ContentDelta::TextDelta { text },
+                        ..
+                    }) => Some(serde_json::json!({
+                        "type": "text_chunk",
+                        "text": text,
+                    }).to_string()),
+                    QueryEvent::ToolStart { tool_name, tool_id, input_json } => {
+                        Some(serde_json::json!({
+                            "type": "tool_start",
+                            "tool_name": tool_name,
+                            "tool_id": tool_id,
+                            "input": input_json,
+                        }).to_string())
+                    }
+                    QueryEvent::ToolEnd { tool_name, tool_id, result, is_error } => {
+                        Some(serde_json::json!({
+                            "type": "tool_end",
+                            "tool_name": tool_name,
+                            "tool_id": tool_id,
+                            "result": result,
+                            "is_error": is_error,
+                        }).to_string())
+                    }
+                    _ => None,
+                };
+                if let Some(payload) = relay_payload {
+                    let _ = relay_ev_tx.try_send(payload);
+                }
+            }
             app.handle_query_event(evt);
         }
 
@@ -1609,7 +1697,7 @@ async fn run_interactive(
         if let Some(runtime) = bridge_runtime.as_mut() {
             loop {
                 match runtime.tui_rx.try_recv() {
-                    Ok(TuiBridgeEvent::Connected { session_url, session_id: _ }) => {
+                    Ok(TuiBridgeEvent::Connected { session_url, session_id: conn_sid }) => {
                         let short = if session_url.len() > 60 {
                             format!("{}…", &session_url[..60])
                         } else {
@@ -1630,6 +1718,70 @@ async fn run_interactive(
                         session.remote_session_url = Some(session_url.clone());
                         session.updated_at = chrono::Utc::now();
                         let _ = cc_core::history::save_session(&session).await;
+
+                        // Wire the BridgeSessionInfo relay so live tool/text events reach
+                        // the web UI via /api/bridge/sessions. This runs alongside
+                        // run_bridge_loop as a best-effort supplementary delivery path.
+                        if let Some(ref token) = bridge_token {
+                            let info = std::sync::Arc::new(cc_bridge::BridgeSessionInfo {
+                                session_id: conn_sid.clone(),
+                                session_url: session_url.clone(),
+                                token: token.clone(),
+                            });
+                            bridge_session_info = Some(info.clone());
+
+                            // Relay consumer: moves relay_ev_rx (taken from the Option)
+                            // into a background task that calls post_bridge_event per item.
+                            if let Some(rx) = relay_ev_rx_opt.take() {
+                                let info_relay = info.clone();
+                                tokio::spawn(async move {
+                                    let mut rx = rx;
+                                    while let Some(payload) = rx.recv().await {
+                                        let _ = cc_bridge::post_bridge_event(
+                                            &info_relay,
+                                            payload,
+                                        )
+                                        .await;
+                                    }
+                                });
+                            }
+
+                            // Poll task: periodically calls poll_bridge_messages and
+                            // forwards inbound user messages to remote_prompt_tx.
+                            let info_poll = info.clone();
+                            let poll_tx = remote_prompt_tx.clone();
+                            tokio::spawn(async move {
+                                let mut since_id: Option<String> = None;
+                                loop {
+                                    match cc_bridge::poll_bridge_messages(
+                                        &info_poll,
+                                        since_id.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(msgs) if !msgs.is_empty() => {
+                                            for msg in &msgs {
+                                                since_id = Some(msg.id.clone());
+                                                if msg.role == "user" {
+                                                    if poll_tx
+                                                        .send(msg.content.clone())
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    tokio::time::sleep(
+                                        std::time::Duration::from_secs(2),
+                                    )
+                                    .await;
+                                }
+                            });
+                        }
                     }
                     Ok(TuiBridgeEvent::Disconnected { reason }) => {
                         app.bridge_state = BridgeConnectionState::Disconnected;
@@ -1753,6 +1905,52 @@ async fn run_interactive(
         }
         if disconnect_bridge {
             bridge_runtime = None;
+        }
+
+        // Drain inbound prompts from the BridgeSessionInfo poll task.
+        // These are user messages received from the web UI via poll_bridge_messages
+        // and injected here just like TuiBridgeEvent::InboundPrompt.
+        while let Ok(content) = remote_prompt_rx.try_recv() {
+            if !app.is_streaming {
+                app.set_prompt_text(content.clone());
+                messages.push(cc_core::types::Message::user(content.clone()));
+                app.push_message(cc_core::types::Message::user(content.clone()));
+                session.messages = messages.clone();
+                session.updated_at = chrono::Utc::now();
+                app.is_streaming = true;
+                app.streaming_text.clear();
+                let ct = CancellationToken::new();
+                cancel = Some(ct.clone());
+                let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+                let msgs_arc_clone = msgs_arc.clone();
+                let tools_arc_clone = tools_arc.clone();
+                let ctx_clone = tool_ctx.clone();
+                let mut qcfg = base_query_config.clone();
+                qcfg.model = cmd_ctx.config.effective_model().to_string();
+                qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                let tracker = cost_tracker.clone();
+                let tx = event_tx.clone();
+                let client_clone = client.clone();
+                let handle = tokio::spawn(async move {
+                    let mut msgs = msgs_arc_clone.lock().await.clone();
+                    let outcome = cc_query::run_query_loop(
+                        client_clone.as_ref(),
+                        &mut msgs,
+                        tools_arc_clone.as_slice(),
+                        &ctx_clone,
+                        &qcfg,
+                        tracker,
+                        Some(tx),
+                        ct,
+                        None,
+                    )
+                    .await;
+                    *msgs_arc_clone.lock().await = msgs;
+                    outcome
+                });
+                current_query = Some((handle, msgs_arc));
+                break; // process one prompt per frame
+            }
         }
 
         // Drain CLAUDE_STATUS_COMMAND results (most recent wins)

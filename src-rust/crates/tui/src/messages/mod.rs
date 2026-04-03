@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use cc_core::types::{ContentBlock, Message, Role, ToolResultContent};
+use crate::kitty_image::render_image;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -765,16 +766,19 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
             }
             ContentBlock::Image { source } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                let label = source
-                    .url
-                    .clone()
-                    .or(source.media_type.clone())
-                    .unwrap_or_else(|| "embedded image".to_string());
-                lines.extend(prefix_message_lines(
-                    render_attachment_line("Image", label),
-                    &msg.role,
-                    ctx.width,
-                ));
+                // Attempt Kitty graphics protocol rendering.  When the
+                // terminal supports it and the source carries inline base64
+                // data, `render_image` emits the APC escape sequence directly
+                // to stdout and returns `None` — nothing more to do for this
+                // block.  Otherwise it returns a human-readable fallback
+                // string that we display as a normal styled line.
+                if let Some(label) = render_image(&source) {
+                    lines.extend(prefix_message_lines(
+                        render_attachment_line("Image", label),
+                        &msg.role,
+                        ctx.width,
+                    ));
+                }
             }
             ContentBlock::Document { title, context, source, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);

@@ -69,7 +69,7 @@ pub use powershell::PowerShellTool;
 pub use send_message::{SendMessageTool, drain_inbox, peek_inbox};
 pub use skill_tool::SkillTool;
 pub use sleep::SleepTool;
-pub use tasks::{TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool};
+pub use tasks::{TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool, Task, TaskStatus, TASK_STORE};
 pub use tool_search::ToolSearchTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
@@ -78,7 +78,7 @@ pub use computer_use::ComputerUseTool;
 pub use mcp_auth_tool::McpAuthTool;
 pub use repl_tool::ReplTool;
 pub use synthetic_output::SyntheticOutputTool;
-pub use team_tool::{TeamCreateTool, TeamDeleteTool};
+pub use team_tool::{TeamCreateTool, TeamDeleteTool, register_agent_runner, AgentRunFn};
 pub use remote_trigger::RemoteTriggerTool;
 
 // ---------------------------------------------------------------------------
@@ -219,6 +219,7 @@ impl ToolContext {
             description: description.to_string(),
             details: None,
             is_read_only,
+            context_description: None,
         };
         let decision = self.permission_handler.request_permission(&request);
         match decision {
@@ -226,6 +227,35 @@ impl ToolContext {
             _ => Err(cc_core::error::ClaudeError::PermissionDenied(format!(
                 "Permission denied for tool '{}'",
                 tool_name
+            ))),
+        }
+    }
+
+    /// Like `check_permission` but also passes structured `details` text
+    /// (e.g. a risk explanation) that the TUI permission dialog can display.
+    ///
+    /// Used by PowerShellTool (and any future tool) when it needs to show
+    /// the user *why* a command is considered risky before they approve it.
+    pub fn check_permission_with_details(
+        &self,
+        tool_name: &str,
+        description: &str,
+        details: &str,
+        is_read_only: bool,
+    ) -> Result<(), cc_core::error::ClaudeError> {
+        let request = PermissionRequest {
+            tool_name: tool_name.to_string(),
+            description: description.to_string(),
+            details: Some(details.to_string()),
+            is_read_only,
+            context_description: None,
+        };
+        let decision = self.permission_handler.request_permission(&request);
+        match decision {
+            PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
+            _ => Err(cc_core::error::ClaudeError::PermissionDenied(format!(
+                "Permission denied for tool '{}': {}",
+                tool_name, details
             ))),
         }
     }

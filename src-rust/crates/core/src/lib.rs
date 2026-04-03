@@ -33,6 +33,12 @@ pub mod message_utils;
 // Per-session file modification history (T4-6).
 pub mod file_history;
 
+// Feature flag management via GrowthBook.
+pub mod feature_flags;
+
+// MCP resource prompt template rendering with variable substitution.
+pub mod mcp_templates;
+
 // Re-export commonly used types at the crate root
 pub use error::{ClaudeError, Result};
 pub use types::{
@@ -42,6 +48,7 @@ pub use types::{
 pub use config::{Config, McpServerConfig, OutputFormat, PermissionMode, Settings, Theme};
 pub use cost::CostTracker;
 pub use history::ConversationSession;
+pub use feature_flags::FeatureFlagManager;
 pub use permissions::{
     AutoPermissionHandler, InteractivePermissionHandler,
     ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler,
@@ -1548,6 +1555,9 @@ pub mod permissions {
         pub description: String,
         pub details: Option<String>,
         pub is_read_only: bool,
+        /// Context-aware description showing user WHY the tool needs permission.
+        /// E.g. "bash: execute `ls -la /home`", "write file: /path/to/.bashrc", "fetch: https://example.com"
+        pub context_description: Option<String>,
     }
 
     // -----------------------------------------------------------------------
@@ -2643,6 +2653,7 @@ pub mod settings_sync;
 pub mod effort;
 pub mod prompt_history;
 pub mod bash_classifier;
+pub mod ps_classifier;
 
 // ---------------------------------------------------------------------------
 // tasks module — background task registry
@@ -3126,6 +3137,7 @@ mod tests {
             description: format!("{} operation", tool_name),
             details: None,
             is_read_only,
+            context_description: None,
         }
     }
 

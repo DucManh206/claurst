@@ -35,6 +35,8 @@ pub mod context_viz;
 pub mod export_dialog;
 /// Clipboard image paste and Ctrl+V text paste.
 pub mod image_paste;
+/// Inline image rendering via the Kitty graphics protocol (with text fallback).
+pub mod kitty_image;
 /// Application state and main event loop.
 pub mod app;
 /// Input helpers: slash command parsing.
@@ -97,6 +99,10 @@ pub mod invalid_config_dialog;
 pub mod bypass_permissions_dialog;
 /// First-launch onboarding / welcome dialog.
 pub mod onboarding_dialog;
+/// Push-to-talk voice capture and Whisper transcription.
+pub mod voice_capture;
+/// Task progress overlay (Ctrl+T) — shows task status with inline toggle.
+pub mod tasks_overlay;
 
 // ---------------------------------------------------------------------------
 // Public re-exports

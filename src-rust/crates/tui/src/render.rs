@@ -10,6 +10,7 @@ use crate::clawd::{clawd_lines, ClawdPose};
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
 use crate::session_browser::render_session_browser;
+use crate::tasks_overlay::render_tasks_overlay;
 use crate::dialogs::{render_mcp_approval_dialog, render_permission_dialog};
 use crate::feedback_survey::render_feedback_survey;
 use crate::overage_upsell::render_overage_upsell;
@@ -379,6 +380,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // Rewind flow (takes over screen)
     if app.rewind_flow.visible {
         render_rewind_flow(frame, &app.rewind_flow, size);
+    }
+
+    // Tasks overlay (Ctrl+T)
+    if app.tasks_overlay.visible {
+        render_tasks_overlay(frame, &app.tasks_overlay, size);
     }
 
     // New help overlay
@@ -1375,10 +1381,14 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 Some(state) => format!("PR #{} [{}]", pr_num, state),
                 None => format!("PR #{}", pr_num),
             };
+            // Colors mirror TS PrBadge getPrStatusColor + TS ink color names:
+            //   approved → Green, changes_requested → Red (error),
+            //   pending / review_required → Yellow (warning), merged → Magenta.
             let pr_color = match app.pr_state.as_deref() {
                 Some("approved") => Color::Green,
                 Some("changes_requested") => Color::Red,
-                Some("review_required") => Color::Yellow,
+                Some("merged") => Color::Magenta,
+                Some("pending") | Some("review_required") => Color::Yellow,
                 Some(_) => Color::Gray,
                 None => Color::Cyan,
             };
@@ -1413,15 +1423,22 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // Vim mode indicator (only when non-insert in vim mode, to save space)
-        if app.prompt_input.vim_enabled && app.prompt_input.vim_mode == VimMode::Insert {
+        // Vim mode indicator — shown for all modes using neovim "-- MODE --" convention.
+        // INSERT is dim (common, low-noise); other modes use bright colour.
+        if app.prompt_input.vim_enabled {
             if !spans.is_empty() {
                 spans.push(Span::raw("  "));
             }
-            spans.push(Span::styled(
-                "-- INSERT --",
-                Style::default().fg(Color::DarkGray),
-            ));
+            let (label, style) = match app.prompt_input.vim_mode {
+                VimMode::Insert      => ("-- INSERT --",       Style::default().fg(Color::DarkGray)),
+                VimMode::Normal      => ("-- NORMAL --",       Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                VimMode::Visual      => ("-- VISUAL --",       Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                VimMode::VisualLine  => ("-- VISUAL LINE --",  Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                VimMode::VisualBlock => ("-- VISUAL BLOCK --", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                VimMode::Command     => ("-- COMMAND --",      Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                VimMode::Search      => ("-- SEARCH --",       Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            };
+            spans.push(Span::styled(label, style));
         }
 
         // Bash prefix indicator — shown when prompt starts with '!'
@@ -1526,13 +1543,18 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // 3. Cost
+        // 3. Cost — mirrors TS formatCost: 4 decimal places for costs < $0.50, else 2.
         if app.cost_usd > 0.0 {
             if !parts.is_empty() {
                 parts.push(Span::raw("  "));
             }
+            let cost_str = if app.cost_usd < 0.5 {
+                format!("${:.4}", app.cost_usd)
+            } else {
+                format!("${:.2}", app.cost_usd)
+            };
             parts.push(Span::styled(
-                format!("${:.2}", app.cost_usd),
+                cost_str,
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -1563,22 +1585,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // 5. Vim mode indicator
-        if app.prompt_input.vim_enabled {
-            let (mode_str, mode_color) = match app.prompt_input.vim_mode {
-                VimMode::Insert => ("[INSERT]", Color::Blue),
-                VimMode::Normal => ("[NORMAL]", Color::Green),
-                VimMode::Visual => ("[VISUAL]", Color::Magenta),
-                VimMode::VisualLine => ("[VISUAL LINE]", Color::Magenta),
-                VimMode::VisualBlock => ("[VISUAL BLOCK]", Color::Magenta),
-                VimMode::Command => ("[COMMAND]", Color::Cyan),
-                VimMode::Search => ("[SEARCH]", Color::Yellow),
-            };
-            if !parts.is_empty() {
-                parts.push(Span::raw("  "));
-            }
-            parts.push(Span::styled(mode_str, Style::default().fg(mode_color)));
-        }
+        // 5. Vim mode — displayed on the left side as "-- MODE --"; nothing extra on right.
 
         // 6. Agent type badge
         if let Some(ref badge) = app.agent_type_badge {

@@ -1178,6 +1178,67 @@ pub async fn post_bridge_response(
     }
 }
 
+/// Post a single streaming tool/text event to the bridge server (non-blocking,
+/// best-effort).
+///
+/// POSTs `{"event": <payload>, "ts": <unix_ms>}` to
+/// `/api/bridge/sessions/<session_id>/events`.
+///
+/// Errors are returned to the caller, who should treat them as transient and
+/// ignore them so the query loop is never blocked.
+pub async fn post_bridge_event(
+    info: &BridgeSessionInfo,
+    payload: String,
+) -> anyhow::Result<()> {
+    let server_url = std::env::var("CLAUDE_CODE_BRIDGE_URL")
+        .or_else(|_| std::env::var("CLAUDE_BRIDGE_BASE_URL"))
+        .unwrap_or_else(|_| "https://claude.ai".to_string());
+
+    // Validate session_id before URL interpolation.
+    BridgeConfig::validate_id(&info.session_id, "session_id")?;
+
+    let url = format!(
+        "{}/api/bridge/sessions/{}/events",
+        server_url, info.session_id
+    );
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .user_agent(format!("claude-code-rust/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("post_bridge_event: failed to build HTTP client")?;
+
+    let body = serde_json::json!({
+        "event": payload,
+        "ts": chrono::Utc::now().timestamp_millis(),
+    });
+
+    debug!(
+        session_id = %info.session_id,
+        "Posting bridge event"
+    );
+
+    let resp = http
+        .post(&url)
+        .bearer_auth(&info.token)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .context("post_bridge_event: HTTP POST failed")?;
+
+    let status = resp.status().as_u16();
+    if resp.status().is_success() {
+        debug!(session_id = %info.session_id, "Bridge event posted");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "post_bridge_event: server returned HTTP {}",
+            status
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TUI-facing bridge event types (bridge → TUI state machine)
 // ---------------------------------------------------------------------------

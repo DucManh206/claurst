@@ -76,6 +76,7 @@ mime = "0.3"
 urlencoding = "2"
 open = "5"
 qrcode = "0.14"
+icy_sixel = "0.5"
 
 # Text processing
 similar = "2"
@@ -88,6 +89,9 @@ nix = { version = "0.29", features = ["process", "signal", "user"] }
 
 # Async channels
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 
 # JSON Schema
 schemars = { version = "0.8", features = ["derive"] }

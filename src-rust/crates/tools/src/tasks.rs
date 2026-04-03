@@ -108,7 +108,8 @@ impl Task {
 }
 
 /// Global task store shared across all tool invocations.
-static TASK_STORE: Lazy<Arc<DashMap<String, Task>>> =
+/// Public so the TUI can access and display tasks.
+pub static TASK_STORE: Lazy<Arc<DashMap<String, Task>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 // ---------------------------------------------------------------------------

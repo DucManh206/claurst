@@ -22,6 +22,8 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 parking_lot = { workspace = true }
 tokio-util = { workspace = true }
+once_cell = { workspace = true }
+dashmap = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

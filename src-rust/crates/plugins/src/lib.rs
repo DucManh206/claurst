@@ -25,6 +25,47 @@ pub use plugin::{
 };
 pub use registry::PluginRegistry;
 
+// ---------------------------------------------------------------------------
+// Capability enforcement
+// ---------------------------------------------------------------------------
+
+/// Check whether a plugin command is allowed to execute based on its declared
+/// capability grants and the capability the action requires.
+///
+/// # Policy
+/// - If the manifest has **no `capabilities` field** (`None`), the plugin
+///   predates capability enforcement and is trusted unconditionally (backwards
+///   compatibility with existing plugins).
+/// - If the manifest declares an explicit list (even an empty one), the
+///   required capability **must** appear in that list.
+///
+/// Returns `Ok(())` when execution is permitted, or `Err(reason)` when it
+/// should be blocked.  The caller should convert `Err` into a `ToolResult::error`.
+pub fn check_plugin_capability(def: &PluginCommandDef) -> Result<(), String> {
+    // Determine what capability this action needs.
+    let required = match def.run_action.required_capability() {
+        None => return Ok(()), // StaticResponse — no capability needed.
+        Some(cap) => cap,
+    };
+
+    match &def.plugin_capabilities {
+        // No `capabilities` field — old-style manifest, allow everything.
+        None => Ok(()),
+        // Explicit capability list — enforce it.
+        Some(granted) => {
+            if granted.iter().any(|g| g.as_str() == required) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Plugin '{}' is not allowed to use capability '{}'. \
+                     Add '{}' to the 'capabilities' list in its manifest to enable this action.",
+                    def.plugin_name, required, required
+                ))
+            }
+        }
+    }
+}
+
 use std::path::Path;
 use std::sync::OnceLock;
 

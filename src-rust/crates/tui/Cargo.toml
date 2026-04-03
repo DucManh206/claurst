@@ -3,6 +3,10 @@ name = "cc-tui"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Enable real microphone capture for voice PTT mode.
+voice = ["cc-core/voice", "dep:cpal", "dep:hound"]
+
 [dependencies]
 cc-core = { workspace = true }
 cc-api = { workspace = true }
@@ -25,6 +29,12 @@ similar = { workspace = true }
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 once_cell = { workspace = true }
 base64 = { workspace = true }
+reqwest = { workspace = true }
+dashmap = { workspace = true }
+icy_sixel = { workspace = true }
+# Optional audio capture for voice PTT (gated behind the `voice` feature)
+cpal = { version = "0.15", optional = true }
+hound = { version = "3.5", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

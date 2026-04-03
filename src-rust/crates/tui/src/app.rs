@@ -7,6 +7,7 @@ use crate::dialogs::PermissionRequest;
 use crate::diff_viewer::{DiffViewerState, build_turn_diff};
 use crate::model_picker::{EffortLevel, ModelPickerState, FAST_MODE_MODEL};
 use crate::session_browser::SessionBrowserState;
+use crate::tasks_overlay::TasksOverlay;
 use crate::dialogs::McpApprovalDialogState;
 use crate::mcp_view::{McpServerView, McpToolView, McpViewState, McpViewStatus};
 use crate::notifications::{NotificationKind, NotificationQueue};
@@ -30,6 +31,7 @@ use cc_core::keybindings::{
 };
 use cc_core::types::{Message, Role};
 use cc_query::QueryEvent;
+use cc_tools;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -426,6 +428,8 @@ pub struct App {
     pub model_picker: ModelPickerState,
     /// Session browser overlay (/session, /resume, /rename, /export).
     pub session_browser: SessionBrowserState,
+    /// Task progress overlay (Ctrl+T) — shows task status with toggle capability.
+    pub tasks_overlay: TasksOverlay,
     /// Export format picker dialog (/export).
     pub export_dialog: ExportDialogState,
     /// Context window / rate limit visualization overlay (/context).
@@ -657,6 +661,7 @@ impl App {
             elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
             model_picker: ModelPickerState::new(),
             session_browser: SessionBrowserState::new(),
+            tasks_overlay: TasksOverlay::new(),
             export_dialog: ExportDialogState::new(),
             context_viz: ContextVizState::new(),
             mcp_approval: McpApprovalDialogState::new(),
@@ -1378,6 +1383,55 @@ impl App {
         self.refresh_prompt_input();
     }
 
+    // -----------------------------------------------------------------------
+    // Voice PTT helpers
+    // -----------------------------------------------------------------------
+
+    /// Start PTT recording: open the microphone capture stream and signal the
+    /// UI.  No-op when no voice recorder is attached or recording is already
+    /// in progress.
+    pub fn handle_voice_ptt_start(&mut self) {
+        if self.voice_recording || self.voice_recorder.is_none() {
+            return;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        self.voice_event_rx = Some(rx);
+        self.voice_recording = true;
+        if let Some(ref recorder_arc) = self.voice_recorder {
+            let recorder = recorder_arc.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut r) = recorder.lock() {
+                    tokio::runtime::Handle::current()
+                        .block_on(r.start_recording(tx))
+                        .ok();
+                }
+            });
+        }
+        self.status_message = Some("Recording\u{2026} release V or press Enter to transcribe".to_string());
+    }
+
+    /// Stop PTT recording: flip the AtomicBool inside VoiceRecorder so the
+    /// capture thread exits, then fire a "Transcribing…" notice.  The
+    /// transcript text arrives later via `voice_event_rx` and is injected into
+    /// the prompt by the event-loop drain.
+    pub fn handle_voice_ptt_stop(&mut self) {
+        if !self.voice_recording {
+            return;
+        }
+        self.voice_recording = false;
+        if let Some(ref recorder_arc) = self.voice_recorder {
+            let recorder = recorder_arc.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut r) = recorder.lock() {
+                    tokio::runtime::Handle::current()
+                        .block_on(r.stop_recording())
+                        .ok();
+                }
+            });
+        }
+        self.status_message = Some("Transcribing\u{2026}".to_string());
+    }
+
     pub fn attach_turn_diff_state(
         &mut self,
         file_history: Arc<parking_lot::Mutex<FileHistory>>,
@@ -1642,6 +1696,22 @@ impl App {
                         _ => {}
                     }
                 }
+            }
+            return false;
+        }
+
+        // Tasks overlay intercepts navigation and Esc
+        if self.tasks_overlay.visible {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.tasks_overlay.close(),
+                KeyCode::Up => self.tasks_overlay.select_prev(),
+                KeyCode::Down => self.tasks_overlay.select_next(),
+                KeyCode::Enter => {
+                    if let Some((task_id, new_status)) = self.tasks_overlay.cycle_and_persist_status() {
+                        self.status_message = Some(format!("Task {} → {}", task_id, new_status));
+                    }
+                }
+                _ => {}
             }
             return false;
         }
@@ -1974,6 +2044,23 @@ impl App {
             return false;
         }
 
+        // ---- Voice PTT: plain V press starts recording when voice is on ----
+        // This is the "hold to talk" variant.  The user presses V to begin
+        // recording; releasing V (handled in the run loop) or pressing Enter
+        // stops the capture and triggers transcription.
+        // Only active when voice mode is enabled (voice_recorder is Some) and
+        // the prompt input is in default (non-vim) mode so 'v' doesn't conflict
+        // with vim keybindings.
+        if key.code == KeyCode::Char('v')
+            && key.modifiers == KeyModifiers::NONE
+            && self.voice_recorder.is_some()
+            && !self.voice_recording
+            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
+        {
+            self.handle_voice_ptt_start();
+            return false;
+        }
+
         // ---- Ctrl+V — clipboard paste (image first, then text fallback) ----
         // Only fires when NOT in vim Normal/Visual/VisualBlock mode (where \x16 is
         // already consumed by the vim handler above to enter VisualBlock mode).
@@ -2000,6 +2087,15 @@ impl App {
             } else if let Some(text) = read_clipboard_text() {
                 self.prompt_input.paste(&text);
             }
+            return false;
+        }
+
+        // ---- Enter while PTT recording: stop capture instead of submitting ----
+        if key.code == KeyCode::Enter
+            && self.voice_recording
+            && self.voice_recorder.is_some()
+        {
+            self.handle_voice_ptt_stop();
             return false;
         }
 
@@ -2045,6 +2141,11 @@ impl App {
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.global_search.open();
                 self.refresh_global_search();
+            }
+
+            // ---- Tasks overlay (Ctrl+T) --------------------------------
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.tasks_overlay.toggle();
             }
 
             // ---- Help overlay ------------------------------------------
@@ -2978,6 +3079,66 @@ impl App {
                 }
             }
 
+            // Drain voice transcription events (non-blocking).
+            // When the background recording/transcription task emits a
+            // TranscriptReady event we insert the text directly into the
+            // prompt so the user can review and submit it.
+            {
+                use cc_core::voice::VoiceEvent;
+                let mut events = Vec::new();
+                if let Some(ref mut rx) = self.voice_event_rx {
+                    while let Ok(ev) = rx.try_recv() {
+                        events.push(ev);
+                    }
+                }
+                for ev in events {
+                    match ev {
+                        VoiceEvent::RecordingStarted => {
+                            self.voice_recording = true;
+                            self.status_message =
+                                Some("Recording\u{2026} press V again or Enter to stop".to_string());
+                        }
+                        VoiceEvent::RecordingStopped => {
+                            self.voice_recording = false;
+                            self.status_message =
+                                Some("Transcribing\u{2026}".to_string());
+                        }
+                        VoiceEvent::TranscriptReady(text) => {
+                            if !text.is_empty() {
+                                // Append to existing prompt text with a space separator
+                                // so the user can combine voice + typed input.
+                                if !self.prompt_input.text.is_empty()
+                                    && !self.prompt_input.text.ends_with(' ')
+                                {
+                                    self.prompt_input.paste(" ");
+                                }
+                                self.prompt_input.paste(&text);
+                                self.refresh_prompt_input();
+                                self.status_message = Some(
+                                    format!("Transcribed: {}", &text[..text.len().min(60)])
+                                );
+                            }
+                            // Clear the channel once we have the result.
+                            self.voice_event_rx = None;
+                        }
+                        VoiceEvent::Error(msg) => {
+                            self.voice_recording = false;
+                            self.voice_event_rx = None;
+                            self.notifications.push(
+                                NotificationKind::Warning,
+                                format!("Voice: {}", msg),
+                                Some(8),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Refresh task list if the overlay is visible (every frame for live updates)
+            if self.tasks_overlay.visible {
+                self.tasks_overlay.refresh_tasks(&cc_tools::TASK_STORE);
+            }
+
             // Draw the frame
             terminal.draw(|f| render::render_app(f, self))?;
 
@@ -2985,8 +3146,20 @@ impl App {
             if event::poll(std::time::Duration::from_millis(50))? {
                 match event::read()? {
                     Event::Key(key) => {
-                        // On Windows crossterm fires Press + Release; only handle Press.
+                        // On Windows crossterm fires both Press and Release events.
+                        // We normally skip non-press events, but when voice PTT mode
+                        // is active we need the Release event for the `V` key so we
+                        // can stop recording as soon as the user lifts the key.
                         if key.kind != crossterm::event::KeyEventKind::Press {
+                            // Handle V-key release to stop PTT recording.
+                            if key.kind == crossterm::event::KeyEventKind::Release
+                                && key.code == KeyCode::Char('v')
+                                && key.modifiers == KeyModifiers::NONE
+                                && self.voice_recording
+                                && self.voice_recorder.is_some()
+                            {
+                                self.handle_voice_ptt_stop();
+                            }
                             continue;
                         }
                         let should_submit = self.handle_key_event(key);
